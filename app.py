@@ -31,6 +31,7 @@ def load_model():
     return portable.Model(MODEL_DIR)
 
 
+@st.cache_resource
 def train_fallback(history):
     """Fallback for first deployment if model/ has not yet been uploaded."""
     from sklearn.compose import ColumnTransformer
@@ -55,9 +56,9 @@ def train_fallback(history):
     pipe = make_pipeline(
         prep,
         xgb.XGBClassifier(
-            n_estimators=300, learning_rate=0.05, max_depth=3,
+            n_estimators=150, learning_rate=0.05, max_depth=3,
             subsample=0.9, colsample_bytree=0.9,
-            random_state=42, eval_metric="logloss"
+            random_state=42, eval_metric="logloss", n_jobs=2, tree_method="hist"
         )
     )
     train = history[history["cohort"] <= 2024]
