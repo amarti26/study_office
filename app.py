@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +18,7 @@ LEAKS = {
 
 @st.cache_data(ttl=3600)
 def load_data():
+    """Download the two datasets once per hour instead of on every rerun."""
     history = pd.read_csv(URL + "history_week6.csv")
     new = pd.read_csv(URL + "new_week6.csv")
     return history, new
@@ -26,6 +26,7 @@ def load_data():
 
 @st.cache_resource
 def load_model():
+    """Load the portable model once and reuse it across reruns and users."""
     if not (MODEL_DIR / "booster.json").exists():
         return None
     return portable.Model(MODEL_DIR)
@@ -66,24 +67,89 @@ def train_fallback(history):
     return pipe, features
 
 
-history, new = load_data()
-portable_model = load_model()
+@st.cache_resource
+def load_app():
+    """Prepare model inference once; widget changes only rerun the cheap UI code."""
+    history, new = load_data()
+    portable_model = load_model()
 
-if portable_model is not None:
-    features = portable_model.features
-    new["risk"] = portable_model.predict_proba(new[features])
-    val = history[history["cohort"] == 2025].copy()
-    val["risk"] = portable_model.predict_proba(val[features])
-    predictor = portable_model
-else:
-    pipe, features = train_fallback(history)
-    val = history[history["cohort"] == 2025].copy()
-    val["risk"] = pipe.predict_proba(val[features])[:, 1]
-    new["risk"] = pipe.predict_proba(new[features])[:, 1]
-    predictor = None
+    if portable_model is not None:
+        features = portable_model.features
+        predictor = portable_model
+        new = new.copy()
+        new["risk"] = predictor.predict_proba(new[features])
+        val = history[history["cohort"] == 2025].copy()
+        val["risk"] = predictor.predict_proba(val[features])
+    else:
+        pipe, features = train_fallback(history)
+        predictor = None
+        new = new.copy()
+        new["risk"] = pipe.predict_proba(new[features])[:, 1]
+        val = history[history["cohort"] == 2025].copy()
+        val["risk"] = pipe.predict_proba(val[features])[:, 1]
+
+    new_sorted = new.sort_values("risk", ascending=False).reset_index(drop=True)
+    show_cols = [
+        "student_id", "risk", "top_40", "international", "programme",
+        "fees_owed", "submitted_share", "missed_last3", "weeks_since_login"
+    ]
+    new_sorted["top_40"] = False
+    new_sorted.loc[:39, "top_40"] = True
+
+    top40_val = val.nlargest(40, "risk")
+    val_left_total = int(val["left"].sum())
+    top40_left = int(top40_val["left"].sum())
+    top40_recall = top40_left / val_left_total if val_left_total else 0.0
+    top40_precision = top40_left / 40 if len(top40_val) else 0.0
+
+    global_top40 = val["risk"].rank(ascending=False, method="first") <= 40
+    group = val.groupby("international").agg(
+        students=("left", "size"),
+        leave_rate=("left", "mean"),
+        mean_risk=("risk", "mean"),
+    )
+    group_recall = (
+        val.loc[val["left"] == 1]
+        .assign(top40=global_top40[val["left"] == 1])
+        .groupby("international")["top40"]
+        .mean()
+        .rename("recall_top40")
+    )
+    group = group.join(group_recall).reset_index()
+    group["group"] = group["international"].map({0: "Domestic", 1: "International"})
+
+    ranked_csv = new_sorted[show_cols].to_csv(index=False).encode("utf-8")
+
+    return (
+        history, new, val, predictor, new_sorted, show_cols, ranked_csv,
+        top40_left, val_left_total, top40_recall, top40_precision, group
+    )
+
+
+@st.cache_data(max_entries=100)
+def get_student_contribution(student_id):
+    """Cache the expensive XGBoost pred_contribs calculation per student."""
+    _, new, _, predictor, _, _, _, _, _, _, _, _ = load_app()
+    if predictor is None:
+        return None
+
+    row = new.loc[new["student_id"] == student_id]
+    if row.empty:
+        return None
+
+    return predictor.contributions(row).iloc[0].sort_values()
+
+
+(
+    history, new, val, predictor, new_sorted, show_cols, ranked_csv,
+    top40_left, val_left_total, top40_recall, top40_precision, group
+) = load_app()
+
 
 st.title("🎓 Study Office Risk Support")
-st.caption("Decision support at the end of week 6 — the model provides a risk signal; an adviser makes the decision.")
+st.caption(
+    "Decision support at the end of week 6 — the model provides a risk signal; an adviser makes the decision."
+)
 
 st.info(
     "The list is not an automatic decision. Review the student's context before contacting them, "
@@ -91,24 +157,18 @@ st.info(
 )
 
 st.header("1. This week's list")
-new_sorted = new.sort_values("risk", ascending=False).copy()
-new_sorted["top_40"] = False
-new_sorted.iloc[:40, new_sorted.columns.get_loc("top_40")] = True
-
-show_cols = [
-    "student_id", "risk", "top_40", "international", "programme",
-    "fees_owed", "submitted_share", "missed_last3", "weeks_since_login"
-]
 st.dataframe(
-    new_sorted[show_cols].style.format({"risk": "{:.1%}", "submitted_share": "{:.0%}"}),
+    new_sorted[show_cols].style.format({
+        "risk": "{:.1%}",
+        "submitted_share": "{:.0%}"
+    }),
     use_container_width=True,
     hide_index=True,
 )
 
-csv = new_sorted[show_cols].to_csv(index=False).encode("utf-8")
 st.download_button(
     "Download ranked 2026 list",
-    data=csv,
+    data=ranked_csv,
     file_name="study_office_2026_ranked.csv",
     mime="text/csv",
 )
@@ -142,31 +202,13 @@ st.write(
 )
 
 st.subheader("Capacity rule: top 40")
-top40_val = val.nlargest(40, "risk")
-p40 = top40_val["left"].mean()
-r40 = top40_val["left"].sum() / val["left"].sum()
 st.write(
-    f"The top-40 rule reaches **{int(top40_val['left'].sum())}** of "
-    f"{int(val['left'].sum())} students who later left: recall **{r40:.1%}**. "
-    f"Among the 40 contacted, **{p40:.1%}** later left: precision **{p40:.1%}**."
+    f"The top-40 rule reaches **{top40_left}** of {val_left_total} students who later left: "
+    f"recall **{top40_recall:.1%}**. Among the 40 contacted, **{top40_precision:.1%}** later left: "
+    f"precision **{top40_precision:.1%}**."
 )
 
 st.header("3. Per group")
-val["top40"] = val["risk"].rank(ascending=False, method="first") <= 40
-
-group = val.groupby("international").agg(
-    students=("left", "size"),
-    leave_rate=("left", "mean"),
-    mean_risk=("risk", "mean"),
-)
-group_recall = (
-    val[val["left"] == 1]
-    .groupby("international")["top40"]
-    .mean()
-    .rename("recall_top40")
-)
-group = group.join(group_recall).reset_index()
-group["group"] = group["international"].map({0: "Domestic", 1: "International"})
 st.dataframe(
     group[["group", "students", "leave_rate", "mean_risk", "recall_top40"]]
     .style.format({
@@ -180,24 +222,27 @@ st.dataframe(
 
 st.header("4. Why is a student on the list?")
 student = st.selectbox("Choose a 2026 student", new_sorted["student_id"].tolist())
-row = new_sorted[new_sorted["student_id"] == student].iloc[0]
-
+row = new_sorted.loc[new_sorted["student_id"] == student].iloc[0]
 st.write(f"**Predicted risk: {row['risk']:.1%}**")
 
 if predictor is not None:
-    contrib = predictor.contributions(new[new["student_id"] == student]).iloc[0]
-    contrib = contrib.sort_values()
-    st.dataframe(
-        pd.DataFrame({
-            "feature": list(contrib.index),
-            "model contribution": list(contrib.values),
-        })
-        .sort_values("model contribution", key=lambda s: s.abs(), ascending=False)
-        .head(8)
-        .style.format({"model contribution": "{:+.3f}"}),
-        use_container_width=True,
-        hide_index=True,
-    )
+    contrib = get_student_contribution(student)
+    if contrib is not None:
+        st.dataframe(
+            pd.DataFrame({
+                "feature": list(contrib.index),
+                "model contribution": list(contrib.values),
+            })
+            .sort_values(
+                "model contribution",
+                key=lambda s: s.abs(),
+                ascending=False
+            )
+            .head(8)
+            .style.format({"model contribution": "{:+.3f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
 else:
     st.write("Portable model files are not present, so feature contributions are unavailable in fallback mode.")
 
